@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -69,7 +70,6 @@ import com.agnesai.android.ui.theme.DarkContainer
 import com.agnesai.android.ui.theme.DarkSurface
 import com.agnesai.android.ui.theme.DarkSurfaceVariant
 import com.agnesai.android.ui.theme.SubtleText
-import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -81,8 +81,8 @@ fun ChatScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     var showMenu by remember { mutableStateOf(false) }
 
-    // Auto-scroll to bottom when new messages arrive
-    LaunchedEffect(uiState.messages.size) {
+    // Auto-scroll to bottom when new messages arrive or content updates (streaming)
+    LaunchedEffect(uiState.messages.size, uiState.messages.lastOrNull()?.content?.length) {
         if (uiState.messages.isNotEmpty()) {
             listState.animateScrollToItem(uiState.messages.size - 1)
         }
@@ -95,6 +95,8 @@ fun ChatScreen(
             viewModel.clearError()
         }
     }
+
+    val isBusy = uiState.isLoading || uiState.isStreaming
 
     Column(
         modifier = Modifier
@@ -128,14 +130,16 @@ fun ChatScreen(
                         Text(
                             text = "Agnes AI",
                             style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
+                            fontWeight = FontWeight.SemiBold,
                             color = MaterialTheme.colorScheme.onSurface
                         )
-                        Text(
-                            text = if (uiState.isLoading) "Thinking..." else "Online",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (uiState.isLoading) AccentPurple else Color(0xFF4CAF81)
-                        )
+                        if (uiState.isStreaming) {
+                            Text(
+                                text = "Đang trả lời...",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AccentPurple
+                            )
+                        }
                     }
                 }
             },
@@ -149,20 +153,27 @@ fun ChatScreen(
                 }
                 DropdownMenu(
                     expanded = showMenu,
-                    onDismissRequest = { showMenu = false }
+                    onDismissRequest = { showMenu = false },
+                    containerColor = DarkSurface
                 ) {
                     DropdownMenuItem(
-                        text = { Text("Clear conversation") },
+                        text = { Text("Xóa cuộc trò chuyện", color = MaterialTheme.colorScheme.onSurface) },
                         onClick = {
                             viewModel.clearConversation()
+                            showMenu = false
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Tải memory từ GitHub", color = MaterialTheme.colorScheme.onSurface) },
+                        onClick = {
+                            viewModel.loadMemoryFromGitHub()
                             showMenu = false
                         }
                     )
                 }
             },
             colors = TopAppBarDefaults.topAppBarColors(
-                containerColor = DarkSurface,
-                scrolledContainerColor = DarkSurface
+                containerColor = DarkBackground
             )
         )
 
@@ -171,17 +182,13 @@ fun ChatScreen(
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
+                contentPadding = PaddingValues(vertical = 8.dp)
             ) {
-                items(
-                    items = uiState.messages,
-                    key = { message -> message.id }
-                ) { message ->
+                items(uiState.messages, key = { it.id }) { message ->
                     MessageBubble(message = message)
                 }
 
-                // Typing indicator
+                // Show loading indicator (initial request before first chunk)
                 if (uiState.isLoading) {
                     item {
                         TypingIndicator()
@@ -196,95 +203,115 @@ fun ChatScreen(
             ) { data ->
                 Snackbar(
                     snackbarData = data,
-                    containerColor = DarkSurfaceVariant,
+                    containerColor = DarkSurface,
                     contentColor = MaterialTheme.colorScheme.onSurface
                 )
             }
         }
 
-        // Input Area
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(DarkSurface)
-                .imePadding()
-        ) {
-            // Attachment previews
-            AnimatedVisibility(visible = uiState.pendingAttachments.isNotEmpty()) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    uiState.pendingAttachments.forEach { filePath ->
-                        FileAttachmentCard(
-                            fileName = filePath.substringAfterLast('/'),
-                            onRemove = { viewModel.removeAttachment(filePath) }
-                        )
-                    }
-                }
-            }
-
+        // Pending attachments
+        if (uiState.pendingAttachments.isNotEmpty()) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.Bottom,
+                    .background(DarkSurface)
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // Attach button
-                IconButton(
-                    onClick = {
-                        // File picker - Agent 2 will wire up real file selection
-                        viewModel.attachFile("/placeholder/file.txt")
-                    },
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clip(CircleShape)
-                        .background(DarkContainer)
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.AttachFile,
-                        contentDescription = "Attach file",
-                        tint = SubtleText
+                uiState.pendingAttachments.forEach { path ->
+                    FileAttachmentCard(
+                        filePath = path,
+                        onRemove = { viewModel.removeAttachment(path) }
                     )
                 }
+            }
+        }
 
-                // Text input
-                TextField(
-                    value = uiState.inputText,
-                    onValueChange = viewModel::onInputTextChange,
-                    modifier = Modifier.weight(1f),
-                    placeholder = {
-                        Text(
-                            text = "Message Agnes...",
-                            color = SubtleText,
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    },
-                    shape = RoundedCornerShape(24.dp),
-                    colors = TextFieldDefaults.colors(
-                        focusedContainerColor = DarkContainer,
-                        unfocusedContainerColor = DarkContainer,
-                        focusedIndicatorColor = Color.Transparent,
-                        unfocusedIndicatorColor = Color.Transparent,
-                        focusedTextColor = MaterialTheme.colorScheme.onSurface,
-                        unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
-                        cursorColor = AccentPurple
-                    ),
-                    maxLines = 6
+        // Input area
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(DarkSurface)
+                .padding(horizontal = 12.dp, vertical = 8.dp)
+                .imePadding(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            // Attach button
+            IconButton(
+                onClick = { /* TODO: open file picker */ },
+                enabled = !isBusy,
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .background(DarkContainer)
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.AttachFile,
+                    contentDescription = "Đính kèm file",
+                    tint = if (!isBusy) SubtleText else SubtleText.copy(alpha = 0.4f)
                 )
+            }
 
-                // Send button
+            // Text input
+            TextField(
+                value = uiState.inputText,
+                onValueChange = viewModel::onInputTextChange,
+                modifier = Modifier.weight(1f),
+                enabled = !isBusy,
+                placeholder = {
+                    Text(
+                        text = if (isBusy) "Đang xử lý..." else "Nhắn tin Agnes...",
+                        color = SubtleText,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                },
+                shape = RoundedCornerShape(24.dp),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = DarkContainer,
+                    unfocusedContainerColor = DarkContainer,
+                    disabledContainerColor = DarkContainer.copy(alpha = 0.6f),
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent,
+                    disabledIndicatorColor = Color.Transparent,
+                    focusedTextColor = MaterialTheme.colorScheme.onSurface,
+                    unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+                    cursorColor = AccentPurple
+                ),
+                maxLines = 6
+            )
+
+            // Stop / Send button
+            if (uiState.isStreaming) {
+                // Stop streaming button
                 IconButton(
-                    onClick = { viewModel.sendMessage() },
-                    enabled = uiState.inputText.isNotBlank() && !uiState.isLoading,
+                    onClick = { viewModel.stopStreaming() },
                     modifier = Modifier
                         .size(44.dp)
                         .clip(CircleShape)
                         .background(
-                            if (uiState.inputText.isNotBlank() && !uiState.isLoading)
+                            Brush.linearGradient(listOf(
+                                androidx.compose.ui.graphics.Color(0xFFE53935),
+                                androidx.compose.ui.graphics.Color(0xFFB71C1C)
+                            ))
+                        )
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Stop,
+                        contentDescription = "Dừng",
+                        tint = Color.White
+                    )
+                }
+            } else {
+                // Send button
+                IconButton(
+                    onClick = { viewModel.sendMessage() },
+                    enabled = uiState.inputText.isNotBlank() && !isBusy,
+                    modifier = Modifier
+                        .size(44.dp)
+                        .clip(CircleShape)
+                        .background(
+                            if (uiState.inputText.isNotBlank() && !isBusy)
                                 Brush.linearGradient(listOf(AccentPurple, AccentIndigo))
                             else
                                 Brush.linearGradient(listOf(DarkContainer, DarkContainer))
@@ -292,9 +319,8 @@ fun ChatScreen(
                 ) {
                     Icon(
                         imageVector = Icons.Filled.Send,
-                        contentDescription = "Send message",
-                        tint = if (uiState.inputText.isNotBlank() && !uiState.isLoading)
-                            Color.White else SubtleText
+                        contentDescription = "Gửi",
+                        tint = if (uiState.inputText.isNotBlank() && !isBusy) Color.White else SubtleText
                     )
                 }
             }
@@ -306,36 +332,29 @@ fun ChatScreen(
 private fun TypingIndicator() {
     val infiniteTransition = rememberInfiniteTransition(label = "typing")
     val dot1Alpha by infiniteTransition.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1f,
+        initialValue = 0.2f, targetValue = 1f,
         animationSpec = infiniteRepeatable(
             animation = tween(600, easing = LinearEasing),
             repeatMode = RepeatMode.Reverse
-        ),
-        label = "dot1"
+        ), label = "dot1"
     )
     val dot2Alpha by infiniteTransition.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1f,
+        initialValue = 0.2f, targetValue = 1f,
         animationSpec = infiniteRepeatable(
             animation = tween(600, delayMillis = 200, easing = LinearEasing),
             repeatMode = RepeatMode.Reverse
-        ),
-        label = "dot2"
+        ), label = "dot2"
     )
     val dot3Alpha by infiniteTransition.animateFloat(
-        initialValue = 0.2f,
-        targetValue = 1f,
+        initialValue = 0.2f, targetValue = 1f,
         animationSpec = infiniteRepeatable(
             animation = tween(600, delayMillis = 400, easing = LinearEasing),
             repeatMode = RepeatMode.Reverse
-        ),
-        label = "dot3"
+        ), label = "dot3"
     )
 
     Row(
-        modifier = Modifier
-            .padding(horizontal = 20.dp, vertical = 4.dp),
+        modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
         horizontalArrangement = Arrangement.Start,
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -343,11 +362,7 @@ private fun TypingIndicator() {
             modifier = Modifier
                 .size(36.dp)
                 .clip(CircleShape)
-                .background(
-                    Brush.linearGradient(
-                        colors = listOf(AccentPurple, AccentIndigo)
-                    )
-                ),
+                .background(Brush.linearGradient(listOf(AccentPurple, AccentIndigo))),
             contentAlignment = Alignment.Center
         ) {
             Icon(
@@ -366,24 +381,9 @@ private fun TypingIndicator() {
             horizontalArrangement = Arrangement.spacedBy(5.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Box(
-                modifier = Modifier
-                    .size(8.dp)
-                    .clip(CircleShape)
-                    .background(AccentPurple.copy(alpha = dot1Alpha))
-            )
-            Box(
-                modifier = Modifier
-                    .size(8.dp)
-                    .clip(CircleShape)
-                    .background(AccentPurple.copy(alpha = dot2Alpha))
-            )
-            Box(
-                modifier = Modifier
-                    .size(8.dp)
-                    .clip(CircleShape)
-                    .background(AccentPurple.copy(alpha = dot3Alpha))
-            )
+            Box(Modifier.size(8.dp).clip(CircleShape).background(AccentPurple.copy(alpha = dot1Alpha)))
+            Box(Modifier.size(8.dp).clip(CircleShape).background(AccentPurple.copy(alpha = dot2Alpha)))
+            Box(Modifier.size(8.dp).clip(CircleShape).background(AccentPurple.copy(alpha = dot3Alpha)))
         }
     }
 }
