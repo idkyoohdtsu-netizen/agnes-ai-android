@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Agnes AI</string>
+    <string name="chat_title">Chat</string>
+    <string name="files_title">Files</string>
+    <string name="settings_title">Settings</string>
+    <string name="send_message">Send message</string>
+    <string name="attach_file">Attach file</string>
+    <string name="message_hint">Message Agnes...</string>
+    <string name="agnes_ai_description">Your intelligent AI assistant</string>
+    <string name="configure_api_key">Configure your API key in Settings to enable AI</string>
+    <string name="github_memory">GitHub Memory Storage</string>
+</resources>
