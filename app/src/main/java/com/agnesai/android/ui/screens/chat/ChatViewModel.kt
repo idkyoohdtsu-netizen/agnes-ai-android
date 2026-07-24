@@ -4,10 +4,17 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.agnesai.android.data.local.PreferencesManager
+import com.agnesai.android.data.model.GitHubConfig
 import com.agnesai.android.data.model.Message
 import com.agnesai.android.data.model.MessageRole
 import com.agnesai.android.data.model.TokenConfig
-import kotlinx.coroutines.delay
+import com.agnesai.android.data.repository.AiRepository
+import com.agnesai.android.data.repository.GitHubRepository
+import com.agnesai.android.data.repository.impl.AiRepositoryImpl
+import com.agnesai.android.data.repository.impl.GitHubRepositoryImpl
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -20,19 +27,27 @@ import java.util.UUID
 data class ChatUiState(
     val messages: List<Message> = listOf(
         Message(
-            content = "Hello! I'm Agnes, your AI assistant. How can I help you today?",
+            content = "Xin chào! Tôi là Agnes, trợ lý AI của bạn. Hãy cấu hình API key trong Cài đặt để bắt đầu, hoặc hỏi tôi bất cứ điều gì!",
             role = MessageRole.ASSISTANT
         )
     ),
     val inputText: String = "",
     val isLoading: Boolean = false,
+    val isStreaming: Boolean = false,
     val pendingAttachments: List<String> = emptyList(),
-    val error: String? = null
+    val error: String? = null,
+    val conversationId: String = UUID.randomUUID().toString(),
+    val memorySaved: Boolean = false
 )
 
 class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val preferencesManager = PreferencesManager(application)
+    private val aiRepository: AiRepository = AiRepositoryImpl()
+    private val githubRepository: GitHubRepository = GitHubRepositoryImpl()
+    private val gson = Gson()
+
+    private var streamingJob: Job? = null
 
     private val _uiState = MutableStateFlow(ChatUiState())
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
@@ -44,6 +59,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             initialValue = TokenConfig()
         )
 
+    val githubConfig: StateFlow<GitHubConfig> = preferencesManager.gitHubConfigFlow
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = GitHubConfig()
+        )
+
     fun onInputTextChange(text: String) {
         _uiState.update { it.copy(inputText = text) }
     }
@@ -51,12 +73,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun sendMessage() {
         val text = _uiState.value.inputText.trim()
         if (text.isEmpty() && _uiState.value.pendingAttachments.isEmpty()) return
-        if (_uiState.value.isLoading) return
+        if (_uiState.value.isLoading || _uiState.value.isStreaming) return
+
+        val config = tokenConfig.value
+        val attachments = _uiState.value.pendingAttachments.toList()
 
         val userMessage = Message(
             content = text,
             role = MessageRole.USER,
-            attachments = _uiState.value.pendingAttachments.toList()
+            attachments = attachments
         )
 
         _uiState.update { state ->
@@ -69,45 +94,99 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        viewModelScope.launch {
-            try {
-                // Placeholder AI response - Agent 2 will replace with real API call
-                delay(1500)
-                val responseText = generatePlaceholderResponse(text)
-                val aiMessage = Message(
-                    content = responseText,
-                    role = MessageRole.ASSISTANT
+        if (!config.isConfigured) {
+            _uiState.update { state ->
+                state.copy(
+                    messages = state.messages + Message(
+                        content = "⚠️ Chưa cấu hình API key. Vui lòng vào **Cài đặt** và nhập API key để sử dụng AI.",
+                        role = MessageRole.ASSISTANT
+                    ),
+                    isLoading = false
                 )
-                _uiState.update { state ->
-                    state.copy(
-                        messages = state.messages + aiMessage,
-                        isLoading = false
-                    )
+            }
+            return
+        }
+
+        streamingJob = viewModelScope.launch {
+            // Add empty assistant message placeholder for streaming
+            val assistantMessageId = UUID.randomUUID().toString()
+            _uiState.update { state ->
+                state.copy(
+                    messages = state.messages + Message(
+                        id = assistantMessageId,
+                        content = "",
+                        role = MessageRole.ASSISTANT
+                    ),
+                    isLoading = false,
+                    isStreaming = true
+                )
+            }
+
+            try {
+                val conversationMessages = _uiState.value.messages
+                    .dropLast(1) // exclude empty streaming placeholder
+                    .takeLast(20) // keep last 20 messages for context
+
+                val flow = if (attachments.isNotEmpty()) {
+                    aiRepository.sendMessageWithAttachments(conversationMessages, config, attachments)
+                } else {
+                    aiRepository.sendMessage(conversationMessages, config)
                 }
+
+                flow.collect { chunk ->
+                    _uiState.update { state ->
+                        val updatedMessages = state.messages.map { msg ->
+                            if (msg.id == assistantMessageId) {
+                                msg.copy(content = msg.content + chunk)
+                            } else msg
+                        }
+                        state.copy(messages = updatedMessages)
+                    }
+                }
+
+                _uiState.update { it.copy(isStreaming = false) }
+
+                // Auto-save memory to GitHub if configured
+                val ghConfig = githubConfig.value
+                if (ghConfig.isConfigured) {
+                    saveMemoryToGitHub(ghConfig)
+                }
+
             } catch (e: Exception) {
                 _uiState.update { state ->
+                    val updatedMessages = state.messages.map { msg ->
+                        if (msg.id == assistantMessageId) {
+                            msg.copy(
+                                content = "❌ Lỗi: ${e.message}",
+                                isError = true
+                            )
+                        } else msg
+                    }
                     state.copy(
+                        messages = updatedMessages,
+                        isStreaming = false,
                         isLoading = false,
-                        error = "Failed to get response: ${e.message}"
+                        error = e.message
                     )
                 }
             }
         }
     }
 
+    fun stopStreaming() {
+        streamingJob?.cancel()
+        _uiState.update { it.copy(isStreaming = false, isLoading = false) }
+    }
+
     fun attachFile(filePath: String) {
         _uiState.update { state ->
-            state.copy(
-                pendingAttachments = state.pendingAttachments + filePath
-            )
+            state.copy(pendingAttachments = state.pendingAttachments + filePath)
         }
     }
 
     fun removeAttachment(filePath: String) {
         _uiState.update { state ->
-            state.copy(
-                pendingAttachments = state.pendingAttachments - filePath
-            )
+            state.copy(pendingAttachments = state.pendingAttachments - filePath)
         }
     }
 
@@ -120,7 +199,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             ChatUiState(
                 messages = listOf(
                     Message(
-                        content = "Conversation cleared. How can I help you?",
+                        content = "Cuộc trò chuyện đã được xóa. Tôi có thể giúp gì cho bạn?",
                         role = MessageRole.ASSISTANT
                     )
                 )
@@ -128,18 +207,34 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun generatePlaceholderResponse(input: String): String {
-        return when {
-            input.contains("hello", ignoreCase = true) || input.contains("hi", ignoreCase = true) ->
-                "Hello! It's great to meet you. I'm Agnes, your AI assistant. I'm ready to help you with questions, coding, analysis, creative writing, and much more. What would you like to explore today?"
-            input.contains("help", ignoreCase = true) ->
-                "I'm here to help! I can assist you with:\n\n• **Coding** - Write, review, and debug code\n• **Analysis** - Analyze data and documents\n• **Writing** - Draft emails, reports, and creative content\n• **Research** - Answer questions and explain concepts\n• **Files** - Manage and process your files\n\nWhat do you need help with?"
-            input.contains("code", ignoreCase = true) || input.contains("kotlin", ignoreCase = true) ->
-                "I'd love to help with coding! I'm proficient in Kotlin, Java, Python, JavaScript, and many other languages. Please share the code you're working on or describe what you'd like to build."
-            input.contains("file", ignoreCase = true) ->
-                "I can help you manage files! You can attach files to our conversation using the attachment button below, or navigate to the **Files** tab to browse and manage files stored in your GitHub repository."
-            else ->
-                "I understand you're asking about \"$input\". I'm currently in placeholder mode — configure your API key in **Settings** to enable full AI capabilities. Once configured, I'll provide intelligent, contextual responses using your preferred AI model."
+    fun loadMemoryFromGitHub() {
+        val ghConfig = githubConfig.value
+        if (!ghConfig.isConfigured) return
+
+        viewModelScope.launch {
+            val conversationId = _uiState.value.conversationId
+            githubRepository.loadMemory(ghConfig, conversationId).onSuccess { json ->
+                try {
+                    val type = object : TypeToken<List<Message>>() {}.type
+                    val messages: List<Message> = gson.fromJson(json, type)
+                    if (messages.isNotEmpty()) {
+                        _uiState.update { it.copy(messages = messages) }
+                    }
+                } catch (_: Exception) { }
+            }
+        }
+    }
+
+    private fun saveMemoryToGitHub(ghConfig: GitHubConfig) {
+        viewModelScope.launch {
+            try {
+                val messages = _uiState.value.messages
+                val json = gson.toJson(messages)
+                val conversationId = _uiState.value.conversationId
+                githubRepository.saveMemory(ghConfig, conversationId, json).onSuccess {
+                    _uiState.update { it.copy(memorySaved = true) }
+                }
+            } catch (_: Exception) { }
         }
     }
 }
